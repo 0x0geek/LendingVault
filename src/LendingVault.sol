@@ -50,7 +50,7 @@ contract LendingVault is Ownable {
         uint256 lendingAmount;
     }
 
-    Pool[] public pools; // Staking pools
+    Pool[] public pools;
     mapping(uint256 => mapping(address => Loan)) loans;
     mapping(uint256 => mapping(address => Depositor)) public depositors;
 
