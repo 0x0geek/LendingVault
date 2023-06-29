@@ -7,32 +7,30 @@ import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "./VaultCounter.sol";
 
 contract LendingVault is Ownable {
     using SafeMath for uint256;
+    using VaultCounterLibrary for Vault;
 
     address public constant AGGREGATOR_USDC_ETH =
         0x986b5E1e1755e3C2440e960477f25201B0a8bbD4;
-    address public constant WETH_ADDRESS =
-        0xa463a1eF5Ba7944186cE1FDf795707E21D5D44eE;
-    address public constant USDC_ADDRESS =
+    address public constant USDC_TOKEN_ADDRESS =
         0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d;
 
     struct Pool {
-        IERC20 collateralToken;
-        IERC20 borrowToken;
-        IERC20 lpToken;
-        uint256 depositTokenAmount;
+        bool isEtherLpToken;
         // Daily interest rate
-        uint256 interestRate;
+        uint8 interestRate;
         // Fee for borrower
-        uint256 originalFeeRate;
+        uint8 originalFeeRate;
         // Collateral factor
-
-        uint256 collateralFactor;
+        uint8 collateralFactor;
+        uint256 depositTokenAmount;
         uint256 earnedReward;
-        bool isLpTokenETH;
         uint256 lastRewardedBlock;
+        Vault totalAsset;
+        Vault totalBorrow;
     }
 
     struct Loan {
@@ -50,14 +48,17 @@ contract LendingVault is Ownable {
         uint256 lendingAmount;
     }
 
+    IERC20 public usdcToken;
     Pool[] public pools;
     mapping(uint256 => mapping(address => Loan)) loans;
     mapping(uint256 => mapping(address => Depositor)) public depositors;
 
     AggregatorV3Interface internal usdcEthPriceFeed;
 
-    event DepositMade(address indexed depositor, uint256 amount);
-    event LoanTaken(
+    event PoolCreated(uint32 poolId);
+    event Deposited(uint32 poolId, address indexed depositor, uint256 amount);
+    event Withdraw(uint32 poolId);
+    event BorrowToken(
         address indexed borrower,
         uint256 collateralAmount,
         uint256 borrowedAmount,
@@ -70,106 +71,151 @@ contract LendingVault is Ownable {
         uint256 proceeds
     );
 
+    error ZeroDepositAmount();
+    error InsufficientBalanceForDeposit();
+    error ZeroAmountForWithdraw();
+    error NotAvailableAmountForWithdraw();
+    error AlreadyBorrowed();
+    error InsufficientCollateral();
+    error InsufficientTokenInBalance();
+    error NotExistLoan();
+    error ZeroRepayAmount();
+
     constructor() {
         usdcEthPriceFeed = AggregatorV3Interface(AGGREGATOR_USDC_ETH);
+        usdcToken = IERC20(USDC_TOKEN_ADDRESS);
+
+        createPool(1, 80, 2, true);
+        createPool(2, 90, 1, false);
     }
 
     /**
-     * @dev Create a new staking pool
+     * @dev Create a new pool
      */
     function createPool(
-        IERC20 _lpToken,
-        IERC20 _collateralToken,
         uint8 _interestRate,
         uint8 _collateralFactor,
-        uint8 _originalFeeRate
-    ) external onlyOwner {
+        uint8 _originalFeeRate,
+        bool _isEtherLpToken
+    ) internal onlyOwner {
         Pool memory pool;
 
-        pool.collateralToken = _collateralToken;
-        pool.borrowToken = _lpToken;
-        pool.lpToken = _lpToken;
         pool.interestRate = _interestRate;
         pool.collateralFactor = _collateralFactor;
         pool.originalFeeRate = _originalFeeRate;
+        pool.isEtherLpToken = _isEtherLpToken;
 
         pools.push(pool);
 
-        // uint256 poolId = pools.length - 1;
-        // emit PoolCreated(poolId);
+        uint32 poolId = uint32(pools.length - 1);
+        emit PoolCreated(poolId);
     }
 
-    function deposit(uint256 _poolId, uint256 _amount) external {
-        if (_amount == 0) revert("Deposit amount should be bigger than zero.");
+    function deposit(uint256 _poolId, uint256 _amount) external payable {
+        if (_amount == 0) revert ZeroDepositAmount();
 
         Pool storage pool = pools[_poolId];
         Depositor storage depositor = depositors[_poolId][msg.sender];
 
-        if (pool.lpToken.balanceOf(msg.sender) < _amount)
-            revert("Insufficient LP Token balance");
+        if (pool.isEtherLpToken) {
+            if (msg.value == 0) revert ZeroDepositAmount();
+        } else {
+            if (usdcToken.balanceOf(msg.sender) < _amount)
+                revert InsufficientBalanceForDeposit();
 
-        pool.lpToken.transferFrom(msg.sender, address(this), _amount);
+            usdcToken.transferFrom(msg.sender, address(this), _amount);
+        }
 
         depositor.amount += _amount;
-        pool.depositTokenAmount += _amount;
+
+        uint256 shares = pool.totalAsset.toShares(_amount, false);
+
+        pool.totalAsset.shares += uint128(shares);
+        pool.totalAsset.amount += uint128(_amount);
+
+        Deposited(_poolId, msg.sender, _amount);
     }
 
     function withdraw(uint256 _poolId) external {
         Pool storage pool = pools[_poolId];
         Depositor storage depositor = depositors[_poolId][msg.sender];
 
-        uint256 amount = depositor.amount;
+        if (depositor.amount == 0) revert ZeroAmountForWithdraw();
 
-        if (amount == 0) revert("Withdraw amount can't be zero");
-
-        // get the available USDC amount for withdraw
+        // calculate the available USDC amount for withdraw
         uint256 availableAmount = depositor.amount - depositor.lendingAmount;
-        depositor.amount -= availableAmount;
-        pool.depositTokenAmount -= availableAmount;
 
-        pool.lpToken.approve(msg.sender, availableAmount);
-        pool.lpToken.transfer(msg.sender, availableAmount);
+        if (availableAmount == 0) revert NotAvailableAmountForWithdraw();
+
+        depositor.amount -= availableAmount;
+
+        uint256 shares = pool.totalAsset.toShares(availableAmount, false);
+        pool.totalAsset.shares -= uint128(shares);
+        pool.totalAsset.amount -= uint128(availableAmount);
+
+        if (pool.isEtherLpToken) {
+            payable(msg.sender).transfer(availableAmount);
+        } else {
+            usdcToken.approve(msg.sender, availableAmount);
+            usdcToken.transfer(msg.sender, availableAmount);
+        }
+
+        Withdraw(_poolId, msg.sender);
     }
 
     function borrowToken(
         uint256 _poolId,
         uint256 _amount,
         uint256 _duration
-    ) external {
+    ) external payable {
         Pool storage pool = pools[_poolId];
         Loan storage loanData = loans[_poolId][msg.sender];
 
         // check if borrower already rent
-        if (loanData.collateralAmount > 0)
-            revert("Borrower can only have one active loan at a time");
-
-        if (pool.collateralToken.balanceOf(msg.sender) < _amount)
-            revert("Insufficient collateral");
+        if (loanData.collateralAmount > 0) revert AlreadyBorrowed();
 
         uint256 borrowableAmount;
 
-        // get the borrowable amount from the collateral amount
-        if (pool.isLpTokenETH)
+        if (pool.isEtherLpToken) {
+            // Borrower is going to borrow Ether
+            if (usdcToken.balanceOf(msg.sender) < _amount)
+                revert InsufficientCollateral();
+
             borrowableAmount = getEthUsdcPrice()
                 .mul(_amount)
                 .mul(pool.collateralFactor)
                 .div(100);
-        else
+
+            // check if there is sufficient the borrowable USDC amount in Vault.
+            if (address(this).balance < borrowableAmount)
+                revert InsufficientTokenInBalance();
+
+            usdcToken.transferFrom(msg.sender, address(this), _amount);
+            loanData.collateralAmount = _amount;
+        } else {
+            // Borrower is going to borrow USDC
+            if (msg.value < _amount) revert InsufficientCollateral();
+
             borrowableAmount = getUsdcEthPrice()
                 .mul(_amount)
                 .mul(pool.collateralFactor)
                 .div(100);
 
-        // check if there is sufficient the borrowable USDC amount in Vault.
-        if (pool.borrowToken.balanceOf(address(this)) < borrowableAmount)
-            revert("Insufficient Borrow token balance");
+            // check if there is sufficient the borrowable USDC amount in Vault.
+            if (usdcToken.balanceOf(address(this)) < borrowableAmount)
+                revert InsufficientTokenInBalance();
 
-        pool.collateralToken.transferFrom(msg.sender, address(this), _amount);
+            // update borrower's collateral amount
+            loanData.collateralAmount = msg.value;
+        }
 
-        loanData.collateralAmount = _amount;
+        // update borrower's borrow amount;
         loanData.borrowedAmount = borrowableAmount;
+        // update borrower's borrwed timestamp;
         loanData.timestamp = block.timestamp;
+        // update borrowing period;
         loanData.duration = _duration;
+
         // calculate repayment amount
         loanData.repayAmount = calculateRepaymentAmount(
             _poolId,
@@ -177,61 +223,69 @@ contract LendingVault is Ownable {
             _duration
         );
 
+        // calculate pool's earned reward from borrower's borrowing
         pool.earnedReward = calculateInterest(
             _poolId,
             borrowableAmount,
             _duration
         );
 
-        pool.borrowToken.approve(msg.sender, borrowableAmount);
-        pool.borrowToken.transfer(msg.sender, borrowableAmount);
+        // transfer Token to borrower
+        if (pool.isEtherLpToken) {
+            payable(msg.sender).transfer(borrowableAmount);
+        } else {
+            usdcToken.approve(msg.sender, borrowableAmount);
+            usdcToken.transfer(msg.sender, borrowableAmount);
+        }
+
+        BorrowToken(msg.sender, _amount, borrowableAmount, _duration);
     }
 
-    function repayLoan(uint256 _poolId, uint256 _amount) external {
+    function repayLoan(uint256 _poolId, uint256 _amount) external payable {
         Pool storage pool = pools[_poolId];
         Loan storage loanData = loans[_poolId][msg.sender];
 
-        // check if repay amount is bigger than zero
-        if (_amount == 0) revert("amount should be bigger than zero.");
-
         // check if borrower has an active loan
-        if (loanData.repayAmount <= 0)
-            revert("Borrower does not have an active loan");
+        if (loanData.repayAmount == 0) revert NotExistLoan();
 
-        if (
-            loanData.collateralAmount > 0 &&
-            pool.borrowToken.balanceOf(msg.sender) < _amount
-        ) revert("Borrower doesn't have sufficient token balance for repay");
+        // check if repay amount is bigger than zero
+        if (pool.isEtherLpToken) {
+            if (_amount == 0 || msg.value != _amount) revert ZeroRepayAmount();
+        } else {
+            if (_amount == 0 || usdcToken.balanceOf(msg.sender) == 0)
+                revert ZeroRepayAmount();
+        }
 
-        if (_amount >= loanData.repayAmount) {
-            // repay the borrowable token
-            pool.borrowToken.transferFrom(
+        // If Borrow repays the amount bigger than the current repay amount, _amount should be loanData.repayAmount
+        if (_amount >= loanData.repayAmount) _amount = loanData.repayAmount;
+
+        if (!pool.isEtherLpToken) {
+            // Borrower repays the borrowable token as USDC
+            usdcToken.transferFrom(
                 msg.sender,
                 address(this),
-                loanData.repayAmount
-            );
-            // receive the collateral
-            pool.collateralToken.transfer(
-                msg.sender,
                 loanData.collateralAmount
             );
+        }
 
+        // update loan's repay amount
+        loanData.repayAmount -= _amount;
+
+        // If Borrower doesn't need to repay more, he can get his collateral
+        if (loanData.repayAmount == 0) {
             delete loans[_poolId][msg.sender];
 
-            emit LoanRepaid(msg.sender, loanData.repayAmount);
-        } else {
-            pool.borrowToken.transferFrom(msg.sender, address(this), _amount);
-
-            // Partially repay the loan
-            loanData.repayAmount -= _amount;
-
-            if (loanData.repayAmount <= 0) {
-                pool.collateralToken.transfer(msg.sender, _amount);
-                delete loans[_poolId][msg.sender];
+            if (pool.isEtherLpToken) {
+                // Borrower receives the collateral as USDC token
+                usdcToken.approve(msg.sender, loanData.collateralAmount);
+                usdcToken.transfer(msg.sender, loanData.collateralAmount);
+            } else {
+                // Borrower receives the collateral as Ether
+                payable(address(this)).transfer(loanData.collateralAmount);
             }
-
-            emit LoanRepaid(msg.sender, _amount);
         }
+
+        emit LoanRepaid(msg.sender, _amount);
     }
 
     function calculateInterest(
