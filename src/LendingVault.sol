@@ -155,8 +155,6 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             usdcToken.transferFrom(msg.sender, address(this), _amount);
         }
 
-        console.log("asset amount = %d", assetAmount);
-
         depositor.assetAmount += assetAmount;
 
         pool.currentAmount += _amount;
@@ -175,9 +173,6 @@ contract LendingVault is Ownable, ReEntrancyGuard {
 
         // calculate amount user can withdraw
         uint256 amount = calculateAmount(_poolId, assetAmount);
-        console.log("withdraw amount = %d", amount);
-        console.log("current amount = %d", pool.currentAmount);
-        console.log("total borrow amount = %d", pool.totalBorrowAmount);
 
         // update depositor's asset amount
         depositor.assetAmount -= assetAmount;
@@ -242,8 +237,6 @@ contract LendingVault is Ownable, ReEntrancyGuard {
                 .div(getUsdcEthPrice())
                 .div(100);
 
-            console.log("borrowable amount = %d", borrowableAmount);
-
             // check if there is sufficient the borrowable USDC amount in Vault.
             if (usdcToken.balanceOf(address(this)) < borrowableAmount)
                 revert InsufficientTokenInBalance();
@@ -293,7 +286,6 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             loanData.timestamp + _duration
         );
 
-        console.log("amount = %d", borrowableAmount);
         return (borrowableAmount, repayAmount);
     }
 
@@ -478,7 +470,6 @@ contract LendingVault is Ownable, ReEntrancyGuard {
 
     function getUsdcEthPrice() internal view returns (uint256) {
         (, int256 answer, , , ) = usdcEthPriceFeed.latestRoundData();
-        console.log("answer = %d", uint256(answer));
         // Convert the USDC/ETH price to a decimal value with 18 decimal places
         return uint256(answer);
     }
@@ -497,13 +488,9 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             _duration
         );
 
-        console.log("Interest amount = %d", interestAmount);
-
         // Calculate fees charged on the loan
         uint256 reserveFees = (_loanAmount * pool.reserveFeeRate) / 100;
         uint256 feeAmount = reserveFees;
-
-        console.log("Fee amount = %d", feeAmount);
 
         // Calculate total amount due including interest and fees
         uint256 repayAmount = _loanAmount + interestAmount + feeAmount;
@@ -529,7 +516,6 @@ contract LendingVault is Ownable, ReEntrancyGuard {
         Pool memory pool = pools[_poolId];
 
         uint256 totalLiquidityAmount = getTotalLiquidity(_poolId);
-        console.log("totalLiquidityAmount = %d", totalLiquidityAmount);
 
         uint256 amount = _assetAmount.mul(totalLiquidityAmount).divCeil(
             pool.totalAssetAmount
@@ -545,12 +531,9 @@ contract LendingVault is Ownable, ReEntrancyGuard {
         Pool memory pool = pools[_poolId];
 
         uint256 totalLiquidityAmount = getTotalLiquidity(_poolId);
-        console.log("totalLiquidityAmount = %d", totalLiquidityAmount);
 
         if (pool.totalAssetAmount == 0 || totalLiquidityAmount == 0)
             return _amount;
-
-        console.log("totalAssetAmount = %d", pool.totalAssetAmount);
 
         uint256 assetAmount = _amount.mul(pool.totalAssetAmount).div(
             totalLiquidityAmount
