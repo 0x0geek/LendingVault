@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity 0.8.13;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -8,11 +8,12 @@ import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "./libraries/Math.sol";
+import "./libraries/ReEntrancyGuard.sol";
 
 import "forge-std/Test.sol";
 import "forge-std/console.sol";
 
-contract LendingVault is Ownable {
+contract LendingVault is Ownable, ReEntrancyGuard {
     using SafeMath for uint256;
     using Math for uint256;
 
@@ -45,6 +46,8 @@ contract LendingVault is Ownable {
         uint256 collateralAmount;
         uint256 borrowedAmount;
         uint256 repayAmount;
+        uint256 feeAmount;
+        uint256 interestAmount;
         uint256 timestamp;
         uint256 duration;
     }
@@ -94,7 +97,7 @@ contract LendingVault is Ownable {
     error LoanHasNoCollateral();
     error LoanNotInLiquidate();
     error ZeroAmountForExchange();
-    error InsufficientBalanceForExchange();
+    error InsufficientBalanceForLiquidate();
 
     constructor() {
         usdcEthPriceFeed = AggregatorV3Interface(AGGREGATOR_USDC_ETH);
@@ -126,7 +129,10 @@ contract LendingVault is Ownable {
         emit PoolCreated(poolId);
     }
 
-    function deposit(uint32 _poolId, uint256 _amount) external payable {
+    function deposit(
+        uint32 _poolId,
+        uint256 _amount
+    ) external payable noReentrant {
         if (_amount == 0) revert ZeroAmountForDeposit();
 
         Pool storage pool = pools[_poolId];
@@ -159,7 +165,7 @@ contract LendingVault is Ownable {
         emit Deposited(_poolId, msg.sender, _amount);
     }
 
-    function withdraw(uint32 _poolId) external {
+    function withdraw(uint32 _poolId) external noReentrant {
         Pool storage pool = pools[_poolId];
         Depositor storage depositor = depositors[_poolId][msg.sender];
 
@@ -197,7 +203,7 @@ contract LendingVault is Ownable {
         uint256 _poolId,
         uint256 _amount,
         uint256 _duration
-    ) external payable returns (uint256, uint256) {
+    ) external payable noReentrant returns (uint256, uint256) {
         Pool storage pool = pools[_poolId];
         Loan storage loanData = loans[_poolId][msg.sender];
 
@@ -254,14 +260,17 @@ contract LendingVault is Ownable {
         loanData.duration = _duration;
 
         // calculate repayment amount
-        (uint256 repayAmount, , uint256 feeAmount) = calculateRepaymentAmount(
-            _poolId,
-            borrowableAmount,
-            _duration
-        );
+        (
+            uint256 repayAmount,
+            uint256 interestAmount,
+            uint256 feeAmount
+        ) = calculateRepaymentAmount(_poolId, borrowableAmount, _duration);
 
         // set borrower's pay amount
         loanData.repayAmount = repayAmount;
+        loanData.interestAmount = interestAmount;
+        loanData.feeAmount = feeAmount;
+
         // update pool's total borrow amount
         pool.totalBorrowAmount += repayAmount;
         // update pool's total reserve amount
@@ -288,7 +297,10 @@ contract LendingVault is Ownable {
         return (borrowableAmount, repayAmount);
     }
 
-    function repayLoan(uint256 _poolId, uint256 _amount) external payable {
+    function repayLoan(
+        uint256 _poolId,
+        uint256 _amount
+    ) external payable noReentrant {
         Pool storage pool = pools[_poolId];
         Loan storage loanData = loans[_poolId][msg.sender];
 
@@ -350,86 +362,125 @@ contract LendingVault is Ownable {
 
     function liquidate(
         uint32 _poolId,
-        address _account,
-        uint256 _amount
-    ) external payable returns (uint256) {
-        Pool memory pool = pools[_poolId];
-        Loan memory loanData = loans[_poolId][_account];
+        address _account
+    ) external payable noReentrant returns (uint256) {
+        Pool storage pool = pools[_poolId];
+        Loan storage loanData = loans[_poolId][_account];
 
         // check if Loan owner call liquidate
         if (msg.sender == _account) revert NotAvailableForLoanOwner();
 
+        uint256 collateralAmount = loanData.collateralAmount;
+
         // check if Loan has collateral
-        if (loanData.collateralAmount == 0) revert LoanHasNoCollateral();
+        if (collateralAmount == 0) revert LoanHasNoCollateral();
 
         // check if Loan is at liquidate state
-        if (loanData.timestamp + loanData.duration < block.timestamp)
+        if (loanData.timestamp + loanData.duration > block.timestamp)
             revert LoanNotInLiquidate();
 
-        // check if Loan is at liquidate state
-        if (_amount == 0) revert ZeroAmountForExchange();
-
-        uint256 exchangeAmount;
+        uint256 payAmount = getPayAmountForLiquidateLoan(_poolId, _account);
         uint256 balanceAmount;
 
         if (pool.isEtherLpToken) {
-            if (_amount > msg.value) _amount = msg.value;
-
-            // receive Usdc token from user and transfer Ether with discount percent
-            exchangeAmount = _amount
-                .mul(DISCOUNT_RATE)
-                .mul(USDC_DECIMAL)
-                .div(getUsdcEthPrice())
-                .div(100);
+            if (msg.value < payAmount) revert InsufficientBalanceForLiquidate();
 
             balanceAmount = usdcToken.balanceOf(address(this));
 
-            if (exchangeAmount > balanceAmount) exchangeAmount = balanceAmount;
+            if (payAmount > balanceAmount) payAmount = balanceAmount;
 
-            // transfer Ether with discount %
-            usdcToken.approve(msg.sender, exchangeAmount);
-            usdcToken.transferFrom(address(this), msg.sender, exchangeAmount);
+            // update loan's collateral amount
+            loanData.collateralAmount = 0;
+            // receive Ether from user and transfer Usdc with discount percent
+            usdcToken.approve(msg.sender, payAmount);
+            usdcToken.transferFrom(address(this), msg.sender, payAmount);
         } else {
-            // check if user's USDC token balance is less than amount
-            if (usdcToken.balanceOf(msg.sender) < _amount)
-                revert InsufficientBalanceForExchange();
+            payAmount = getPayAmountForLiquidateLoan(_poolId, _account);
 
-            // receive Ether from user and transfer USDC with dscount percent
-            exchangeAmount = _amount
+            // check if user's USDC token balance is less than amount
+            if (usdcToken.balanceOf(msg.sender) < payAmount)
+                revert InsufficientBalanceForLiquidate();
+
+            // receive Usdc token and transfer Ether to user
+            usdcToken.transferFrom(msg.sender, address(this), payAmount);
+
+            // update loan data's collateral amount
+            loanData.collateralAmount = 0;
+            payable(msg.sender).transfer(loanData.collateralAmount);
+        }
+
+        // update pool's current amount
+        pool.currentAmount += payAmount;
+        pool.totalBorrowAmount -= loanData.repayAmount;
+
+        // check if liquidate payment is more than loan's repay
+        if (loanData.repayAmount < payAmount) {
+            // update pool's reserve amount again
+            pool.totalReserveAmount -= loanData.feeAmount;
+            pool.totalReserveAmount +=
+                payAmount -
+                loanData.interestAmount -
+                loanData.borrowedAmount;
+        } else {
+            // update pool's reserve amount again
+            pool.totalReserveAmount -= loanData.feeAmount;
+        }
+
+        // update loan's data
+        loanData.borrowedAmount = 0;
+        loanData.feeAmount = 0;
+        loanData.interestAmount = 0;
+        loanData.repayAmount = 0;
+        loanData.timestamp = 0;
+
+        return collateralAmount;
+    }
+
+    function getPayAmountForLiquidateLoan(
+        uint32 _poolId,
+        address _account
+    ) public view returns (uint256) {
+        Pool memory pool = pools[_poolId];
+        Loan memory loanData = loans[_poolId][_account];
+
+        uint256 collateralAmount = loanData.collateralAmount;
+        uint256 payAmount;
+
+        if (pool.isEtherLpToken) {
+            payAmount = collateralAmount
                 .mul(getUsdcEthPrice())
                 .mul(DISCOUNT_RATE)
                 .div(100)
                 .div(USDC_DECIMAL);
-
-            balanceAmount = usdcToken.balanceOf(address(this));
-
-            if (exchangeAmount > balanceAmount) exchangeAmount = balanceAmount;
-
-            // receive Usdc token and transfer Ether to user
-            usdcToken.transferFrom(msg.sender, address(this), _amount);
-            payable(msg.sender).transfer(exchangeAmount);
+        } else {
+            payAmount = collateralAmount
+                .mul(DISCOUNT_RATE)
+                .mul(USDC_DECIMAL)
+                .div(getUsdcEthPrice())
+                .div(100);
         }
 
-        pool.currentAmount += _amount;
-
-        if (pool.totalBorrowAmount < _amount) pool.totalBorrowAmount = 0;
-        else pool.totalBorrowAmount -= _amount;
-
-        if (loanData.repayAmount < _amount) loanData.repayAmount = 0;
-        else loanData.repayAmount -= _amount;
-
-        if (loanData.repayAmount == 0) pool.totalReserveAmount += _amount;
-
-        if (loanData.collateralAmount < exchangeAmount)
-            loanData.collateralAmount = 0;
-        else loanData.collateralAmount -= exchangeAmount;
-
-        return exchangeAmount;
+        return payAmount;
     }
 
     function getRepayAmount(uint32 _poolId) public view returns (uint256) {
         Loan memory loanData = loans[_poolId][msg.sender];
         return loanData.repayAmount;
+    }
+
+    function getTotalLiquidity(uint32 _poolId) internal view returns (uint256) {
+        Pool memory pool = pools[_poolId];
+        return
+            pool.totalBorrowAmount.add(pool.currentAmount).sub(
+                pool.totalReserveAmount
+            );
+    }
+
+    function getUsdcEthPrice() internal view returns (uint256) {
+        (, int256 answer, , , ) = usdcEthPriceFeed.latestRoundData();
+        console.log("answer = %d", uint256(answer));
+        // Convert the USDC/ETH price to a decimal value with 18 decimal places
+        return uint256(answer);
     }
 
     // Function to calculate total repayment amount including interest and fees
@@ -458,14 +509,6 @@ contract LendingVault is Ownable {
         uint256 repayAmount = _loanAmount + interestAmount + feeAmount;
 
         return (repayAmount, interestAmount, feeAmount);
-    }
-
-    function getTotalLiquidity(uint32 _poolId) internal view returns (uint256) {
-        Pool memory pool = pools[_poolId];
-        return
-            pool.totalBorrowAmount.add(pool.currentAmount).sub(
-                pool.totalReserveAmount
-            );
     }
 
     /*
@@ -514,13 +557,6 @@ contract LendingVault is Ownable {
         );
 
         return assetAmount;
-    }
-
-    function getUsdcEthPrice() public view returns (uint256) {
-        (, int256 answer, , , ) = usdcEthPriceFeed.latestRoundData();
-        console.log("answer = %d", uint256(answer));
-        // Convert the USDC/ETH price to a decimal value with 18 decimal places
-        return uint256(answer);
     }
 
     function calculateInterest(
