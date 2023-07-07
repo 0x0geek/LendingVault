@@ -16,6 +16,7 @@ import "forge-std/console.sol";
 contract LendingVault is Ownable, ReEntrancyGuard {
     using SafeMath for uint256;
     using Math for uint256;
+    using SafeERC20 for IERC20;
 
     address public constant AGGREGATOR_USDC_ETH =
         0x986b5E1e1755e3C2440e960477f25201B0a8bbD4;
@@ -167,7 +168,7 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             assetAmount = calculateAssetAmount(_poolId, _amount);
 
             // transfer USDC from user to vault contract
-            usdcToken.transferFrom(msg.sender, address(this), _amount);
+            usdcToken.safeTransferFrom(msg.sender, address(this), _amount);
         }
 
         // update depositor's asset amount
@@ -200,10 +201,10 @@ contract LendingVault is Ownable, ReEntrancyGuard {
         // calculate amount user can withdraw
         uint256 amount = calculateAmount(_poolId, assetAmount);
 
+        if (amount > pool.currentAmount) revert NotAvailableForWithdraw();
+
         // update depositor's asset amount
         depositor.assetAmount -= assetAmount;
-
-        if (amount > pool.currentAmount) revert NotAvailableForWithdraw();
 
         // update pool's current liquidity amount
         pool.currentAmount -= amount;
@@ -213,8 +214,7 @@ contract LendingVault is Ownable, ReEntrancyGuard {
         if (pool.isEtherLpToken) {
             payable(msg.sender).transfer(amount);
         } else {
-            usdcToken.approve(msg.sender, amount);
-            usdcToken.transfer(msg.sender, amount);
+            usdcToken.safeTransfer(msg.sender, amount);
         }
 
         emit Withdraw(_poolId, amount);
@@ -314,8 +314,7 @@ contract LendingVault is Ownable, ReEntrancyGuard {
         if (pool.isEtherLpToken) {
             payable(msg.sender).transfer(borrowableAmount);
         } else {
-            usdcToken.approve(msg.sender, borrowableAmount);
-            usdcToken.transfer(msg.sender, borrowableAmount);
+            usdcToken.safeTransfer(msg.sender, borrowableAmount);
         }
 
         emit BorrowToken(
@@ -394,8 +393,7 @@ contract LendingVault is Ownable, ReEntrancyGuard {
 
             if (pool.isEtherLpToken) {
                 // Borrower receives the collateral as USDC token
-                usdcToken.approve(msg.sender, collateralAmount);
-                usdcToken.transfer(msg.sender, collateralAmount);
+                usdcToken.safeTransfer(msg.sender, collateralAmount);
             } else {
                 // Borrower receives the collateral as Ether
                 payable(msg.sender).transfer(collateralAmount);
@@ -446,8 +444,7 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             // update loan's collateral amount
             loanData.collateralAmount = 0;
             // receive Ether from user and transfer Usdc with discount percent
-            usdcToken.approve(msg.sender, payAmount);
-            usdcToken.transferFrom(address(this), msg.sender, payAmount);
+            usdcToken.safeTransfer(msg.sender, payAmount);
         } else {
             payAmount = getPayAmountForLiquidateLoan(_poolId, _account);
 
@@ -456,7 +453,7 @@ contract LendingVault is Ownable, ReEntrancyGuard {
                 revert InsufficientBalanceForLiquidate();
 
             // receive Usdc token and transfer Ether to user
-            usdcToken.transferFrom(msg.sender, address(this), payAmount);
+            usdcToken.safeTransferFrom(msg.sender, address(this), payAmount);
 
             // update loan data's collateral amount
             loanData.collateralAmount = 0;
