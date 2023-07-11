@@ -12,85 +12,62 @@ contract LendingVaultTest is BaseSetup {
 
     LendingVault public vault;
 
-    uint8 internal constant ID_ETHER_POOL = 0;
-    uint8 internal constant ID_USDC_POOL = 1;
     uint256 internal constant PERIOD_180_DAYS = 180;
     uint256 internal constant SKIP_PERIOD_181_DAYS = 181 * 3600 * 24;
 
     function setUp() public virtual override {
         BaseSetup.setUp();
-        vault = new LendingVault();
+
+        // interest rate = 20, collateral factor = 90m and reserve fee rate = 0
+        vault = new LendingVault(20, 90, 0);
     }
 
-    function test_depositInUsdcPool() public {
+    function test_deposit() public {
         // when LP deposit 0, should revert
         vm.startPrank(alice);
         usdc.safeApprove(address(vault), 1000 * USDC_DECIMAL);
         vm.expectRevert(LendingVault.ZeroAmountForDeposit.selector);
-        vault.deposit(ID_USDC_POOL, 0);
+        vault.deposit(0);
         vm.stopPrank();
 
         // when LP's USDC balance is less than the deposit mount, should revert
         vm.startPrank(edward);
         usdc.safeApprove(address(vault), 1000 * USDC_DECIMAL);
         vm.expectRevert(LendingVault.InsufficientBalanceForDeposit.selector);
-        vault.deposit(ID_USDC_POOL, 1000 * USDC_DECIMAL);
+        vault.deposit(1000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // deposit 1000 USDC successfully.
         vm.startPrank(alice);
         usdc.safeApprove(address(vault), 1000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 1000 * USDC_DECIMAL);
+        vault.deposit(1000 * USDC_DECIMAL);
         vm.stopPrank();
     }
 
-    function test_depositInEtherPool() public {
-        // when LP deposit 0, should revert
-        vm.startPrank(alice);
-        vm.expectRevert(LendingVault.ZeroAmountForDeposit.selector);
-        vault.deposit{value: 0}(ID_ETHER_POOL, 0);
-
-        // if deposit amount is more than msg.value, amount should be msg.value
-        vault.deposit{value: 9 * ETHER_DECIMAL}(
-            ID_ETHER_POOL,
-            10 * ETHER_DECIMAL
-        );
-        assertEq(address(vault).balance, 9 * ETHER_DECIMAL);
-
-        // deposit 10 Ether successfully, amount should be 19 * ETHER_DECIMAL
-        vault.deposit{value: 10 * ETHER_DECIMAL}(
-            ID_ETHER_POOL,
-            10 * ETHER_DECIMAL
-        );
-        assertEq(address(vault).balance, 19 * ETHER_DECIMAL);
-        vm.stopPrank();
-    }
-
-    function test_borrowTokenFromUsdcPool() public {
+    function test_borrowToken() public {
         console.log("Vault usdc balance = %d", usdc.balanceOf(address(vault)));
         console.log("Vault ether balance = %d", address(vault).balance);
 
         // Alice deposit 1000 USDC to USDC/ETH pool
         vm.startPrank(alice);
         usdc.safeApprove(address(vault), 1000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 1000 * USDC_DECIMAL);
+        vault.deposit(1000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // Bob deposit 1000 USDC to USDC/ETH pool
         vm.startPrank(bob);
         usdc.safeApprove(address(vault), 4000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 4000 * USDC_DECIMAL);
+        vault.deposit(4000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // Bob transfer 0 Ether and borrows X USDC, should revert
         vm.startPrank(carol);
         vm.expectRevert(LendingVault.ZeroCollateralAmountForBorrow.selector);
-        vault.borrowToken{value: 0}(ID_USDC_POOL, 0, PERIOD_180_DAYS);
+        vault.borrowToken{value: 0}(0, PERIOD_180_DAYS);
 
         // Bob transfer 1 Ether, but amount is 2 Ether, should revert
         vm.expectRevert(LendingVault.InsufficientCollateral.selector);
         vault.borrowToken{value: 1 * ETHER_DECIMAL}(
-            ID_USDC_POOL,
             2 * ETHER_DECIMAL,
             PERIOD_180_DAYS
         );
@@ -98,120 +75,60 @@ contract LendingVaultTest is BaseSetup {
         // Bob transfer 20 Ether, but LendingVault hasn't enough USDC balance, should revert
         vm.expectRevert(LendingVault.InsufficientTokenInBalance.selector);
         vault.borrowToken{value: 20 * ETHER_DECIMAL}(
-            ID_USDC_POOL,
             20 * ETHER_DECIMAL,
             PERIOD_180_DAYS
         );
 
         (uint256 borrowAmount, uint256 repayAmount) = vault.borrowToken{
             value: 1e18
-        }(ID_USDC_POOL, 1e18, PERIOD_180_DAYS);
+        }(1e18, PERIOD_180_DAYS);
         // Bob's borrow amount should be bigger than 1669913000
         assertGe(borrowAmount, 1667902000);
         // Bob's repay amount should be same with the vaule pulled from getRepayAmount()
-        assertEq(repayAmount, vault.getRepayAmount(1));
+        assertEq(repayAmount, vault.getRepayAmount());
 
         // If Bob already borrowed once, should revert
         vm.expectRevert(LendingVault.AlreadyBorrowed.selector);
-        vault.borrowToken{value: 1e18}(ID_USDC_POOL, 1e18, PERIOD_180_DAYS);
+        vault.borrowToken{value: 1e18}(1e18, PERIOD_180_DAYS);
 
         vm.stopPrank();
     }
 
-    function test_borrowTokenFromEtherPool() public {
-        console.log("Vault usdc balance = %d", usdc.balanceOf(address(vault)));
-        console.log("Vault ether balance = %d", address(vault).balance);
-
-        // Alice deposit 1 ether to ETH pool
-        vm.startPrank(alice);
-        vault.deposit{value: 1 * ETHER_DECIMAL}(
-            ID_ETHER_POOL,
-            1 * ETHER_DECIMAL
-        );
-        vm.stopPrank();
-
-        // Bob deposit 3 ether to ETH pool
-        vm.startPrank(bob);
-        vault.deposit{value: 1 * ETHER_DECIMAL}(
-            ID_ETHER_POOL,
-            1 * ETHER_DECIMAL
-        );
-        vm.stopPrank();
-
-        // Carol transfer 0 USDC and borrows X ETH, should revert
-        vm.startPrank(carol);
-        vm.expectRevert(LendingVault.ZeroCollateralAmountForBorrow.selector);
-        vault.borrowToken(ID_ETHER_POOL, 0, PERIOD_180_DAYS);
-
-        // Carol transfer 400000 USDC as his collateral, but he hasn't sufficient balance
-        vm.expectRevert(LendingVault.InsufficientCollateral.selector);
-        vault.borrowToken(
-            ID_ETHER_POOL,
-            4000000 * USDC_DECIMAL,
-            PERIOD_180_DAYS
-        );
-
-        // Carol transfer 9000 USDC, but LendingVault hasn't enough Ether balance, should revert
-        console.log("carol amunt = %d", usdc.balanceOf(address(carol)));
-        usdc.safeApprove(address(vault), 80000 * USDC_DECIMAL);
-        vm.expectRevert(LendingVault.InsufficientTokenInBalance.selector);
-        vault.borrowToken(ID_ETHER_POOL, 80000 * USDC_DECIMAL, PERIOD_180_DAYS);
-
-        usdc.safeApprove(address(vault), 2000 * USDC_DECIMAL);
-        (uint256 borrowAmount, uint256 repayAmount) = vault.borrowToken(
-            ID_ETHER_POOL,
-            2000 * USDC_DECIMAL,
-            PERIOD_180_DAYS
-        );
-
-        // Carol's borrow amount should be more than zero
-        // 2000 * 80% (collateral factor) * 0.000539 (latest price from chainlink aggregator) / 100 / 10 ** 6
-        assertGe(borrowAmount, 0);
-        // Carol's repay amount should be same with the vaule pulled from getRepayAmount()
-        assertEq(repayAmount, vault.getRepayAmount(ID_ETHER_POOL));
-
-        // If Carol already borrowed once, should revert
-        vm.expectRevert(LendingVault.AlreadyBorrowed.selector);
-        vault.borrowToken(ID_ETHER_POOL, 2000 * USDC_DECIMAL, PERIOD_180_DAYS);
-
-        vm.stopPrank();
-    }
-
-    function test_repayLoanInUsdcPool() public {
+    function test_repayLoan() public {
         // Alice deposit 1000 USDC
         vm.startPrank(alice);
         usdc.safeApprove(address(vault), 1000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 1000 * USDC_DECIMAL);
+        vault.deposit(1000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // Bob deposit 4000 USDC
         vm.startPrank(bob);
         usdc.safeApprove(address(vault), 4000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 4000 * USDC_DECIMAL);
+        vault.deposit(4000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // Carol tries to repay 0 as the repay amount, but should revert, cause Carol hasnt a loan yet
         vm.startPrank(carol);
         vm.expectRevert(LendingVault.NotExistLoan.selector);
-        vault.repayLoan(ID_USDC_POOL, 0);
+        vault.repayLoan(0);
 
         // Carol transfer 1 ether as collateral and receive X USDC
         vm.startPrank(carol);
         (uint256 borrowAmount, uint256 repayAmount) = vault.borrowToken{
             value: 1e18
-        }(ID_USDC_POOL, 1e18, 180);
+        }(1e18, 180);
         assertGe(borrowAmount, 0);
-        assertEq(repayAmount, vault.getRepayAmount(ID_USDC_POOL));
+        assertEq(repayAmount, vault.getRepayAmount());
 
         // Carol repay 0 as the repay amount, should revert
         vm.expectRevert(LendingVault.ZeroRepayAmount.selector);
-        vault.repayLoan(ID_USDC_POOL, 0);
+        vault.repayLoan(0);
 
         uint256 balanceBefore = address(carol).balance;
 
         // Carol repay and receive his collateral
         usdc.safeApprove(address(vault), repayAmount);
-        vault.repayLoan(ID_USDC_POOL, repayAmount);
+        vault.repayLoan(repayAmount);
 
         // After Carol repay amount, his collateral amount should be equal with the amount.
         assertEq(address(carol).balance, balanceBefore + 1 * ETHER_DECIMAL);
@@ -219,69 +136,19 @@ contract LendingVaultTest is BaseSetup {
         vm.stopPrank();
     }
 
-    function test_repayLoanInEtherPool() public {
-        // Alice deposit 1000 USDC
-        vm.startPrank(alice);
-        vault.deposit{value: 2 * ETHER_DECIMAL}(
-            ID_ETHER_POOL,
-            2 * ETHER_DECIMAL
-        );
-        vm.stopPrank();
-
-        // Bob deposit 4000 USDC
-        vm.startPrank(bob);
-        vault.deposit{value: 1 * ETHER_DECIMAL}(
-            ID_ETHER_POOL,
-            1 * ETHER_DECIMAL
-        );
-        vm.stopPrank();
-
-        // Carol tries to repay 0 as the repay amount, but should revert, cause Carol hasnt a loan yet
-        vm.startPrank(carol);
-        vm.expectRevert(LendingVault.NotExistLoan.selector);
-        vault.repayLoan(ID_ETHER_POOL, 0);
-
-        // Carol transfer 1 ether as collateral and receive X USDC
-        vm.startPrank(carol);
-        usdc.safeApprove(address(vault), 4000 * USDC_DECIMAL);
-        (uint256 borrowAmount, uint256 repayAmount) = vault.borrowToken(
-            ID_ETHER_POOL,
-            4000 * USDC_DECIMAL,
-            180
-        );
-        assertGe(borrowAmount, 0);
-        assertEq(repayAmount, vault.getRepayAmount(ID_ETHER_POOL));
-
-        // Carol repay 0 as the repay amount, should revert
-        vm.expectRevert(LendingVault.ZeroRepayAmount.selector);
-        vault.repayLoan{value: 0}(ID_ETHER_POOL, 0);
-
-        uint256 balanceBefore = usdc.balanceOf(address(carol));
-        // Carol repay and receive his collateral
-        vault.repayLoan{value: repayAmount}(ID_ETHER_POOL, repayAmount);
-
-        // After Carol repay amount, his collateral amount should be equal with the amount.
-        assertEq(
-            usdc.balanceOf(address(carol)),
-            balanceBefore + 4000 * USDC_DECIMAL
-        );
-
-        vm.stopPrank();
-    }
-
-    function test_withdrawInUsdcPool() public {
+    function test_withdraw() public {
         // Alice tries to withdraw, but he hasn't deposited before, should revert
         vm.startPrank(alice);
         vm.expectRevert(LendingVault.ZeroAmountForWithdraw.selector);
-        vault.withdraw(ID_USDC_POOL);
+        vault.withdraw();
 
         // Alice deposit 1000 USDC
         usdc.safeApprove(address(vault), 1000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 1000 * USDC_DECIMAL);
+        vault.deposit(1000 * USDC_DECIMAL);
 
         uint256 balanceBefore = usdc.balanceOf(address(alice));
         // Alice withdraw
-        vault.withdraw(ID_USDC_POOL);
+        vault.withdraw();
 
         // After Carol withdraw, his USDC balance should be equal with the amount that he deposit before.
         assertEq(
@@ -291,64 +158,43 @@ contract LendingVaultTest is BaseSetup {
         vm.stopPrank();
     }
 
-    function test_withdrawInEtherPool() public {
-        // Alice tries to withdraw, but he hasn't deposited before, should revert
-        vm.startPrank(alice);
-        vm.expectRevert(LendingVault.ZeroAmountForWithdraw.selector);
-        vault.withdraw(ID_ETHER_POOL);
-
-        // Alice deposit 2 ether
-        vault.deposit{value: 2 * ETHER_DECIMAL}(
-            ID_ETHER_POOL,
-            2 * ETHER_DECIMAL
-        );
-
-        uint256 balanceBefore = address(alice).balance;
-        // Alice withdraw
-        vault.withdraw(ID_ETHER_POOL);
-
-        // After Carol withdraw, his ETH balance should be equal with the amount that he deposit before.
-        assertEq(address(alice).balance, balanceBefore + 2 * ETHER_DECIMAL);
-        vm.stopPrank();
-    }
-
     function test_liquidate() public {
         // Alice deposit 1000 USDC
         vm.startPrank(alice);
         usdc.safeApprove(address(vault), 1000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 1000 * USDC_DECIMAL);
+        vault.deposit(1000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // Bob deposit 4000 USDC
         vm.startPrank(bob);
         usdc.safeApprove(address(vault), 4000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 4000 * USDC_DECIMAL);
+        vault.deposit(4000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // Alice tries to liquidate loan, but there is no loan yet, should revert
         vm.startPrank(alice);
         vm.expectRevert(LendingVault.LoanHasNoCollateral.selector);
-        vault.liquidate(ID_USDC_POOL, address(carol));
+        vault.liquidate(address(carol));
         vm.stopPrank();
 
         // Carol transfer 1 ether as collateral and receive X USDC
         vm.startPrank(carol);
         (uint256 borrowAmount, uint256 repayAmount) = vault.borrowToken{
             value: 1 * ETHER_DECIMAL
-        }(ID_USDC_POOL, 1 * ETHER_DECIMAL, PERIOD_180_DAYS);
+        }(1 * ETHER_DECIMAL, PERIOD_180_DAYS);
         assertGe(borrowAmount, 0);
-        assertEq(repayAmount, vault.getRepayAmount(ID_USDC_POOL));
+        assertEq(repayAmount, vault.getRepayAmount());
 
         // Carol tries to liquidate his loan, should revert
         vm.expectRevert(LendingVault.NotAvailableForLoanOwner.selector);
-        vault.liquidate(ID_USDC_POOL, address(carol));
+        vault.liquidate(address(carol));
 
         vm.stopPrank();
 
         vm.startPrank(alice);
         // Alice tries to liquidate carol loan, but the loan is not in liquidate, should revert
         vm.expectRevert(LendingVault.LoanNotInLiquidate.selector);
-        vault.liquidate(ID_USDC_POOL, address(carol));
+        vault.liquidate(address(carol));
         vm.stopPrank();
 
         // Skip 181 days
@@ -357,24 +203,21 @@ contract LendingVaultTest is BaseSetup {
         // Edward tries to liquidate Carol's loan, but he hasn't sufficient balance, should revert
         vm.startPrank(edward);
         vm.expectRevert(LendingVault.InsufficientBalanceForLiquidate.selector);
-        vault.liquidate(ID_USDC_POOL, address(carol));
+        vault.liquidate(address(carol));
         vm.stopPrank();
 
         // Alice liquidate Carol's loan
         vm.startPrank(alice);
         usdc.safeApprove(
             address(vault),
-            vault.getPayAmountForLiquidateLoan(ID_USDC_POOL, address(carol))
+            vault.getPayAmountForLiquidateLoan(address(carol))
         );
-        uint256 collateralAmount = vault.liquidate(
-            ID_USDC_POOL,
-            address(carol)
-        );
+        uint256 collateralAmount = vault.liquidate(address(carol));
         assertEq(collateralAmount, 1 * ETHER_DECIMAL);
         vm.stopPrank();
     }
 
-    function test_integrateTestInUsdcPool() public {
+    function test_integrateTest() public {
         uint256 balanceBefore;
         uint256 balanceAfter;
         uint256 reward;
@@ -382,22 +225,22 @@ contract LendingVaultTest is BaseSetup {
         // Alice deposit 1000 USDC
         vm.startPrank(alice);
         usdc.safeApprove(address(vault), 1000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 1000 * USDC_DECIMAL);
+        vault.deposit(1000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // Bob deposit 4000 USDC
         vm.startPrank(bob);
         usdc.safeApprove(address(vault), 4000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 4000 * USDC_DECIMAL);
+        vault.deposit(4000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // Carol transfer 1 ether as collateral and receive X USDC
         vm.startPrank(carol);
         (uint256 borrowAmount, uint256 repayAmount) = vault.borrowToken{
             value: 1e18
-        }(ID_USDC_POOL, 1e18, 180);
+        }(1e18, 180);
         assertGe(borrowAmount, 0);
-        assertEq(repayAmount, vault.getRepayAmount(ID_USDC_POOL));
+        assertEq(repayAmount, vault.getRepayAmount());
         vm.stopPrank();
 
         // David deposit 5000 USDC
@@ -405,9 +248,9 @@ contract LendingVaultTest is BaseSetup {
         balanceBefore = usdc.balanceOf(address(david));
 
         usdc.safeApprove(address(vault), 5000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 5000 * USDC_DECIMAL);
+        vault.deposit(5000 * USDC_DECIMAL);
         // David withdraw his deposit again
-        vault.withdraw(ID_USDC_POOL);
+        vault.withdraw();
 
         balanceAfter = usdc.balanceOf(address(david));
         console.log("David's balance before = %d", balanceBefore);
@@ -435,7 +278,7 @@ contract LendingVaultTest is BaseSetup {
         // Alice withdraw and get reward
         balanceBefore = usdc.balanceOf(address(alice));
         vm.startPrank(alice);
-        vault.withdraw(ID_USDC_POOL);
+        vault.withdraw();
         vm.stopPrank();
         balanceAfter = usdc.balanceOf(address(alice));
         reward = balanceAfter - balanceBefore - 1000 * USDC_DECIMAL;
@@ -445,13 +288,13 @@ contract LendingVaultTest is BaseSetup {
         // David deposit 5000 USDC
         vm.startPrank(fraig);
         usdc.safeApprove(address(vault), 3000 * USDC_DECIMAL);
-        vault.deposit(ID_USDC_POOL, 3000 * USDC_DECIMAL);
+        vault.deposit(3000 * USDC_DECIMAL);
         vm.stopPrank();
 
         // Alice withdraw and get reward
         balanceBefore = usdc.balanceOf(address(bob));
         vm.startPrank(bob);
-        vault.withdraw(ID_USDC_POOL);
+        vault.withdraw();
         vm.stopPrank();
 
         balanceAfter = usdc.balanceOf(address(bob));
@@ -462,7 +305,7 @@ contract LendingVaultTest is BaseSetup {
         // Carol repay and receive his collateral
         vm.startPrank(carol);
         usdc.safeApprove(address(vault), repayAmount);
-        vault.repayLoan(ID_USDC_POOL, repayAmount);
+        vault.repayLoan(repayAmount);
         vm.stopPrank();
     }
 }

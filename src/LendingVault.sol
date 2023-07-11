@@ -18,30 +18,16 @@ contract LendingVault is Ownable, ReEntrancyGuard {
     using Math for uint256;
     using SafeERC20 for IERC20;
 
-    address public constant AGGREGATOR_USDC_ETH =
-        0x986b5E1e1755e3C2440e960477f25201B0a8bbD4;
-    address public constant USDC_TOKEN_ADDRESS =
-        0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    IERC20 internal constant usdcToken =
+        IERC20(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48);
+    AggregatorV3Interface internal constant usdcEthPriceFeed =
+        AggregatorV3Interface(0x986b5E1e1755e3C2440e960477f25201B0a8bbD4);
 
     uint256 internal constant USDC_DECIMAL = 1e6;
     uint256 internal constant ETHER_DECIMAL = 1e18;
     uint256 internal constant SECONDS_PER_YEAR = 365 days;
     uint256 internal constant ETHER_DECIMAL_FACTOR = 10 ** 2;
     uint256 internal constant DISCOUNT_RATE = 95;
-
-    struct Pool {
-        bool isEtherLpToken;
-        // Daily interest rate
-        uint8 interestRate;
-        // Fee for borrower
-        uint8 reserveFeeRate;
-        // Collateral factor
-        uint8 collateralFactor;
-        uint256 totalBorrowAmount;
-        uint256 totalAssetAmount;
-        uint256 totalReserveAmount;
-        uint256 currentAmount;
-    }
 
     struct Loan {
         uint256 collateralAmount;
@@ -59,15 +45,30 @@ contract LendingVault is Ownable, ReEntrancyGuard {
         uint256 lendingAmount;
     }
 
-    IERC20 public usdcToken;
-    Pool[] public pools;
-    mapping(uint256 => mapping(address => Loan)) loans;
-    mapping(uint256 => mapping(address => Depositor)) public depositors;
+    // Daily interest rate
+    uint8 public interestRate;
+    // Fee for borrower
+    uint8 public reserveFeeRate;
+    // Collateral factor
+    uint8 public collateralFactor;
 
-    AggregatorV3Interface internal usdcEthPriceFeed;
-    event PoolCreated(uint32 poolId);
-    event Deposited(uint32 poolId, address indexed depositor, uint256 amount);
-    event Withdraw(uint32 poolId, uint256 amount);
+    // Current total borrowing amount
+    uint256 public totalBorrowAmount;
+
+    // Current total asset amount based on LP's total deposited amount
+    uint256 public totalAssetAmount;
+
+    // Current total reserver amount
+    uint256 public totalReserveAmount;
+
+    // Current balance amount
+    uint256 public currentBalanceAmount;
+
+    mapping(address => Loan) public loans;
+    mapping(address => Depositor) public depositors;
+
+    event Deposited(address indexed depositor, uint256 amount);
+    event Withdraw(uint256 amount);
     event BorrowToken(
         address indexed borrower,
         uint256 collateralAmount,
@@ -100,98 +101,73 @@ contract LendingVault is Ownable, ReEntrancyGuard {
     error ZeroAmountForExchange();
     error InsufficientBalanceForLiquidate();
 
-    constructor() {
-        usdcEthPriceFeed = AggregatorV3Interface(AGGREGATOR_USDC_ETH);
-        usdcToken = IERC20(USDC_TOKEN_ADDRESS);
-
-        createPool(10, 80, 0, true);
-        createPool(20, 90, 0, false);
-    }
-
-    /**
-     * @dev Create a new pool
-     */
-    function createPool(
+    constructor(
         uint8 _interestRate,
         uint8 _collateralFactor,
-        uint8 _reserveFeeRate,
-        bool _isEtherLpToken
-    ) internal onlyOwner {
-        Pool memory pool;
+        uint8 _reserveFeeRate
+    ) {
+        interestRate = _interestRate;
+        collateralFactor = _collateralFactor;
+        reserveFeeRate = _reserveFeeRate;
+    }
 
-        pool.interestRate = _interestRate;
-        pool.collateralFactor = _collateralFactor;
-        pool.reserveFeeRate = _reserveFeeRate;
-        pool.isEtherLpToken = _isEtherLpToken;
+    function setInterestRate(uint8 _interestRate) external onlyOwner {
+        interestRate = _interestRate;
+    }
 
-        pools.push(pool);
+    function setCollateralFactor(uint8 _collateralFactor) external onlyOwner {
+        collateralFactor = _collateralFactor;
+    }
 
-        uint32 poolId = uint32(pools.length - 1);
-        emit PoolCreated(poolId);
+    function setReserveFeeRate(uint8 _reserveFeeRate) external onlyOwner {
+        reserveFeeRate = _reserveFeeRate;
     }
 
     /**
     @dev Allows a user to deposit tokens into a pool by providing the pool ID and the amount of tokens to deposit.
-    @param _poolId The ID of the pool into which the user wants to deposit tokens.
     @param _amount The amount of tokens the user wants to deposit.
     @notice This function checks if the amount of tokens to deposit is not zero. If the amount of tokens to deposit is not zero, the function calculates the asset amount based on the total liquidity of the pool and the amount of tokens deposited.
             If the pool uses Ether as collateral, the function checks if the transfer Ether amount is not zero and if the transfer Ether amount is less than the amount of tokens to deposit. If the transfer Ether amount is less than the amount of tokens to deposit, the function sets the amount of tokens to deposit to the transfer Ether amount.
             If the pool uses USDC as collateral, the function checks if the user has sufficient balance for deposit and transfers the USDC from the user to the vault contract.
             The function then updates the depositor's asset amount and the pool's data and emits a Deposited event.
     */
-    function deposit(
-        uint32 _poolId,
-        uint256 _amount
-    ) external payable noReentrant {
+    function deposit(uint256 _amount) external payable noReentrant {
         if (_amount == 0) revert ZeroAmountForDeposit();
 
-        Pool storage pool = pools[_poolId];
-        Depositor storage depositor = depositors[_poolId][msg.sender];
+        Depositor storage depositor = depositors[msg.sender];
 
         uint256 assetAmount;
 
-        if (pool.isEtherLpToken) {
-            // check if transfer Ether is not zero
-            if (msg.value == 0) revert ZeroAmountForDeposit();
+        // check if user has sufficient balance for deposit
+        if (usdcToken.balanceOf(msg.sender) < _amount)
+            revert InsufficientBalanceForDeposit();
 
-            // check if transfer Ether amount is less than _amount, _amount should be msg.value
-            if (msg.value != _amount) _amount = msg.value;
+        // calculate asset amount based on total liquidity
+        assetAmount = calculateAssetAmount(_amount);
 
-            // calculate asset amount based on total liquidity
-            assetAmount = calculateAssetAmount(_poolId, _amount);
-        } else {
-            // check if user has sufficient balance for deposit
-            if (usdcToken.balanceOf(msg.sender) < _amount)
-                revert InsufficientBalanceForDeposit();
-
-            // calculate asset amount based on total liquidity
-            assetAmount = calculateAssetAmount(_poolId, _amount);
-
-            // transfer USDC from user to vault contract
-            usdcToken.safeTransferFrom(msg.sender, address(this), _amount);
-        }
+        // transfer USDC from user to vault contract
+        usdcToken.safeTransferFrom(msg.sender, address(this), _amount);
 
         // update depositor's asset amount
         depositor.assetAmount += assetAmount;
 
         // pool's deposit amount
-        pool.currentAmount += _amount;
-        // pool's total amount
-        pool.totalAssetAmount += assetAmount;
+        currentBalanceAmount += _amount;
 
-        emit Deposited(_poolId, msg.sender, _amount);
+        // pool's total amount
+        totalAssetAmount += assetAmount;
+
+        emit Deposited(msg.sender, _amount);
     }
 
     /**
-    @dev Allows a user to withdraw tokens from a pool by providing the pool ID.
-    @param _poolId The ID of the pool from which the user wants to withdraw tokens.
+    @dev Allows a user to withdraw tokens from Vault.
     @notice This function checks if the user has sufficient withdraw amount. If the user has sufficient withdraw amount, the function calculates the amount the user can withdraw based on the pool's current liquidity amount and the user's asset amount.
             The function then updates the depositor's asset amount and the pool's data and transfers the withdrawn tokens to the user.
             If the pool uses Ether as collateral, the function transfers Ether to the user. If the pool uses USDC as collateral, the function approves the transfer of USDC to the user and then transfers the USDC to the user.
     */
-    function withdraw(uint32 _poolId) external noReentrant {
-        Pool storage pool = pools[_poolId];
-        Depositor storage depositor = depositors[_poolId][msg.sender];
+    function withdraw() external noReentrant {
+        Depositor storage depositor = depositors[msg.sender];
 
         uint256 assetAmount = depositor.assetAmount;
 
@@ -199,30 +175,25 @@ contract LendingVault is Ownable, ReEntrancyGuard {
         if (assetAmount == 0) revert ZeroAmountForWithdraw();
 
         // calculate amount user can withdraw
-        uint256 amount = calculateAmount(_poolId, assetAmount);
+        uint256 amount = calculateAmount(assetAmount);
 
-        if (amount > pool.currentAmount) revert NotAvailableForWithdraw();
+        if (amount > currentBalanceAmount) revert NotAvailableForWithdraw();
 
         // update depositor's asset amount
         depositor.assetAmount -= assetAmount;
 
-        // update pool's current liquidity amount
-        pool.currentAmount -= amount;
+        // update current liquidity amount
+        currentBalanceAmount -= amount;
         // update pool's total asset amount
-        pool.totalAssetAmount -= assetAmount;
+        totalAssetAmount -= assetAmount;
 
-        if (pool.isEtherLpToken) {
-            payable(msg.sender).transfer(amount);
-        } else {
-            usdcToken.safeTransfer(msg.sender, amount);
-        }
+        usdcToken.safeTransfer(msg.sender, amount);
 
-        emit Withdraw(_poolId, amount);
+        emit Withdraw(amount);
     }
 
     /**
     @dev Allows a user to borrow tokens from a pool by providing collateral and specifying the duration of the loan.
-    @param _poolId The ID of the pool from which the user wants to borrow tokens.
     @param _amount The amount of collateral the user wants to provide for the loan.
     @param _duration The duration of the loan in days.
     @return A tuple containing the amount of tokens borrowed and the amount to be repaid.
@@ -234,55 +205,32 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             Finally, the function updates the borrower's loan data and the pool's data and transfers the borrowed tokens to the borrower.
     */
     function borrowToken(
-        uint256 _poolId,
         uint256 _amount,
         uint256 _duration
     ) external payable noReentrant returns (uint256, uint256) {
-        Pool storage pool = pools[_poolId];
-        Loan storage loanData = loans[_poolId][msg.sender];
+        Loan storage loanData = loans[msg.sender];
 
         // check if borrower already rent
         if (loanData.collateralAmount > 0) revert AlreadyBorrowed();
 
         uint256 borrowableAmount;
 
-        if (pool.isEtherLpToken) {
-            if (_amount == 0) revert ZeroCollateralAmountForBorrow();
+        if (msg.value == 0) revert ZeroCollateralAmountForBorrow();
+        // Borrower is going to borrow USDC
+        if (msg.value < _amount) revert InsufficientCollateral();
 
-            // Borrower is going to borrow Ether
-            if (usdcToken.balanceOf(msg.sender) < _amount)
-                revert InsufficientCollateral();
+        borrowableAmount = _amount
+            .mul(collateralFactor)
+            .mul(USDC_DECIMAL)
+            .div(getUsdcEthPrice())
+            .div(100);
 
-            borrowableAmount = _amount
-                .mul(getUsdcEthPrice())
-                .mul(pool.collateralFactor)
-                .div(100)
-                .div(USDC_DECIMAL);
+        // check if there is sufficient the borrowable USDC amount in Vault.
+        if (usdcToken.balanceOf(address(this)) < borrowableAmount)
+            revert InsufficientTokenInBalance();
 
-            // check if there is sufficient the borrowable USDC amount in Vault.
-            if (address(this).balance < borrowableAmount)
-                revert InsufficientTokenInBalance();
-
-            usdcToken.transferFrom(msg.sender, address(this), _amount);
-            loanData.collateralAmount = _amount;
-        } else {
-            if (msg.value == 0) revert ZeroCollateralAmountForBorrow();
-            // Borrower is going to borrow USDC
-            if (msg.value < _amount) revert InsufficientCollateral();
-
-            borrowableAmount = _amount
-                .mul(pool.collateralFactor)
-                .mul(USDC_DECIMAL)
-                .div(getUsdcEthPrice())
-                .div(100);
-
-            // check if there is sufficient the borrowable USDC amount in Vault.
-            if (usdcToken.balanceOf(address(this)) < borrowableAmount)
-                revert InsufficientTokenInBalance();
-
-            // update borrower's collateral amount
-            loanData.collateralAmount = msg.value;
-        }
+        // update borrower's collateral amount
+        loanData.collateralAmount = msg.value;
 
         // update borrower's borrow amount;
         loanData.borrowedAmount = borrowableAmount;
@@ -296,26 +244,22 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             uint256 repayAmount,
             uint256 interestAmount,
             uint256 feeAmount
-        ) = calculateRepaymentAmount(_poolId, borrowableAmount, _duration);
+        ) = calculateRepaymentAmount(borrowableAmount, _duration);
 
         // set borrower's pay amount
         loanData.repayAmount = repayAmount;
         loanData.interestAmount = interestAmount;
         loanData.feeAmount = feeAmount;
 
-        // update pool's total borrow amount
-        pool.totalBorrowAmount += repayAmount;
-        // update pool's total reserve amount
-        pool.totalReserveAmount += feeAmount;
-        // update pool's current liquidity amount
-        pool.currentAmount -= borrowableAmount;
+        // update total borrow amount
+        totalBorrowAmount += repayAmount;
+        // update total reserve amount
+        totalReserveAmount += feeAmount;
+        // update current liquidity amount
+        currentBalanceAmount -= borrowableAmount;
 
         // transfer Token to borrower
-        if (pool.isEtherLpToken) {
-            payable(msg.sender).transfer(borrowableAmount);
-        } else {
-            usdcToken.safeTransfer(msg.sender, borrowableAmount);
-        }
+        usdcToken.safeTransfer(msg.sender, borrowableAmount);
 
         emit BorrowToken(
             msg.sender,
@@ -329,7 +273,6 @@ contract LendingVault is Ownable, ReEntrancyGuard {
 
     /**
     @dev Allows a user to repay a loan by providing the pool ID and the amount of tokens to repay.
-    @param _poolId The ID of the pool from which the user wants to repay the loan.
     @param _amount The amount of tokens the user wants to repay.
     @notice This function checks if the borrower has an active loan. If the borrower has an active loan, the function checks if the repay amount is bigger than zero.
             If the pool uses Ether as collateral, the function checks if the transfer Ether amount is not zero and sets the amount of tokens to repay to the transfer Ether amount.
@@ -337,41 +280,28 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             The function then updates the loan's repay amount, the pool's data, and emits a LoanRepaid event.
             If the borrower doesn't need to repay more, the function updates the loan data and transfers the borrower's collateral back to the borrower.
     */
-    function repayLoan(
-        uint256 _poolId,
-        uint256 _amount
-    ) external payable noReentrant {
-        Pool storage pool = pools[_poolId];
-        Loan storage loanData = loans[_poolId][msg.sender];
+    function repayLoan(uint256 _amount) external payable noReentrant {
+        Loan storage loanData = loans[msg.sender];
 
         // check if borrower has an active loan
         if (loanData.repayAmount == 0) revert NotExistLoan();
 
         // check if repay amount is bigger than zero
-        if (pool.isEtherLpToken) {
-            if (_amount == 0 || msg.value == 0) revert ZeroRepayAmount();
-
-            // when transfer Ether, _amount should be equal with the real amount of Ether.
-            _amount = msg.value;
-        } else {
-            if (_amount == 0 || usdcToken.balanceOf(msg.sender) == 0)
-                revert ZeroRepayAmount();
-        }
+        if (_amount == 0 || usdcToken.balanceOf(msg.sender) == 0)
+            revert ZeroRepayAmount();
 
         // If Borrower repays the amount bigger than the current repay amount, _amount should be loanData.repayAmount
         if (_amount >= loanData.repayAmount) _amount = loanData.repayAmount;
 
-        if (!pool.isEtherLpToken) {
-            // Borrower repays the borrowable token as USDC
-            usdcToken.transferFrom(msg.sender, address(this), _amount);
-        }
+        // Borrower repays the borrowable token as USDC
+        usdcToken.transferFrom(msg.sender, address(this), _amount);
 
         // update loan's repay amount
         loanData.repayAmount -= _amount;
 
         // update pools' total borrow amount
-        pool.totalBorrowAmount -= _amount;
-        pool.currentAmount += _amount;
+        totalBorrowAmount -= _amount;
+        currentBalanceAmount += _amount;
 
         // If Borrower doesn't need to repay more, he can get his collateral
         if (loanData.repayAmount == 0) {
@@ -391,13 +321,8 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             // update user collateral amount;
             loanData.collateralAmount = 0;
 
-            if (pool.isEtherLpToken) {
-                // Borrower receives the collateral as USDC token
-                usdcToken.safeTransfer(msg.sender, collateralAmount);
-            } else {
-                // Borrower receives the collateral as Ether
-                payable(msg.sender).transfer(collateralAmount);
-            }
+            // Borrower receives the collateral as Ether
+            payable(msg.sender).transfer(collateralAmount);
         }
 
         emit LoanRepaid(msg.sender, _amount);
@@ -405,7 +330,6 @@ contract LendingVault is Ownable, ReEntrancyGuard {
 
     /**
     @dev Allows a user to liquidate a loan by providing the pool ID and the borrower's address.
-    @param _poolId The ID of the pool from which the user wants to liquidate the loan.
     @param _account The address of the borrower whose loan is being liquidated.
     @notice This function checks if the caller is not the loan owner and if the loan has collateral and is at liquidate state.
             If the pool uses Ether as collateral, the function checks if the caller has sufficient balance for liquidation and transfers the USDC with a discount percent to the caller.
@@ -413,11 +337,9 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             The function then updates the pool's data and the loan data and returns the collateral amount to the caller.
     */
     function liquidate(
-        uint32 _poolId,
         address _account
     ) external payable noReentrant returns (uint256) {
-        Pool storage pool = pools[_poolId];
-        Loan storage loanData = loans[_poolId][_account];
+        Loan storage loanData = loans[_account];
 
         // check if Loan owner call liquidate
         if (msg.sender == _account) revert NotAvailableForLoanOwner();
@@ -431,50 +353,34 @@ contract LendingVault is Ownable, ReEntrancyGuard {
         if (loanData.timestamp + loanData.duration > block.timestamp)
             revert LoanNotInLiquidate();
 
-        uint256 payAmount = getPayAmountForLiquidateLoan(_poolId, _account);
-        uint256 balanceAmount;
+        uint256 payAmount = getPayAmountForLiquidateLoan(_account);
 
-        if (pool.isEtherLpToken) {
-            if (msg.value < payAmount) revert InsufficientBalanceForLiquidate();
+        // check if user's USDC token balance is less than amount
+        if (usdcToken.balanceOf(msg.sender) < payAmount)
+            revert InsufficientBalanceForLiquidate();
 
-            balanceAmount = usdcToken.balanceOf(address(this));
+        // receive Usdc token and transfer Ether to user
+        usdcToken.safeTransferFrom(msg.sender, address(this), payAmount);
 
-            if (payAmount > balanceAmount) payAmount = balanceAmount;
+        // update loan data's collateral amount
+        loanData.collateralAmount = 0;
+        payable(msg.sender).transfer(loanData.collateralAmount);
 
-            // update loan's collateral amount
-            loanData.collateralAmount = 0;
-            // receive Ether from user and transfer Usdc with discount percent
-            usdcToken.safeTransfer(msg.sender, payAmount);
-        } else {
-            payAmount = getPayAmountForLiquidateLoan(_poolId, _account);
-
-            // check if user's USDC token balance is less than amount
-            if (usdcToken.balanceOf(msg.sender) < payAmount)
-                revert InsufficientBalanceForLiquidate();
-
-            // receive Usdc token and transfer Ether to user
-            usdcToken.safeTransferFrom(msg.sender, address(this), payAmount);
-
-            // update loan data's collateral amount
-            loanData.collateralAmount = 0;
-            payable(msg.sender).transfer(loanData.collateralAmount);
-        }
-
-        // update pool's current amount
-        pool.currentAmount += payAmount;
-        pool.totalBorrowAmount -= loanData.repayAmount;
+        // update current total amount
+        currentBalanceAmount += payAmount;
+        totalBorrowAmount -= loanData.repayAmount;
 
         // check if liquidate payment is more than loan's repay
         if (loanData.repayAmount < payAmount) {
             // update pool's reserve amount again
-            pool.totalReserveAmount -= loanData.feeAmount;
-            pool.totalReserveAmount +=
+            totalReserveAmount -= loanData.feeAmount;
+            totalReserveAmount +=
                 payAmount -
                 loanData.interestAmount -
                 loanData.borrowedAmount;
         } else {
             // update pool's reserve amount again
-            pool.totalReserveAmount -= loanData.feeAmount;
+            totalReserveAmount -= loanData.feeAmount;
         }
 
         // update loan's data
@@ -489,7 +395,6 @@ contract LendingVault is Ownable, ReEntrancyGuard {
 
     /**
     @dev Calculates the amount of tokens to pay for liquidating a loan by providing the pool ID and the borrower's address.
-    @param _poolId The ID of the pool from which the user wants to liquidate the loan.
     @param _account The address of the borrower whose loan is being liquidated.
     @return The amount of tokens to pay for liquidating the loan.
     @notice This function retrieves the pool and loan data based on the pool ID and the borrower's address.
@@ -497,55 +402,38 @@ contract LendingVault is Ownable, ReEntrancyGuard {
             If the pool uses USDC as collateral, the function calculates the amount of USDC to pay for liquidating the loan based on the collateral amount and the discount rate.
     */
     function getPayAmountForLiquidateLoan(
-        uint32 _poolId,
         address _account
     ) public view returns (uint256) {
-        Pool memory pool = pools[_poolId];
-        Loan memory loanData = loans[_poolId][_account];
+        Loan memory loanData = loans[_account];
 
         uint256 collateralAmount = loanData.collateralAmount;
-        uint256 payAmount;
-
-        if (pool.isEtherLpToken) {
-            payAmount = collateralAmount
-                .mul(getUsdcEthPrice())
-                .mul(DISCOUNT_RATE)
-                .div(100)
-                .div(USDC_DECIMAL);
-        } else {
-            payAmount = collateralAmount
-                .mul(DISCOUNT_RATE)
-                .mul(USDC_DECIMAL)
-                .div(getUsdcEthPrice())
-                .div(100);
-        }
+        uint256 payAmount = collateralAmount
+            .mul(DISCOUNT_RATE)
+            .mul(USDC_DECIMAL)
+            .div(getUsdcEthPrice())
+            .div(100);
 
         return payAmount;
     }
 
     /**
     @dev Returns the amount of tokens to repay for the loan of the caller by providing the pool ID.
-    @param _poolId The ID of the pool from which the caller wants to get the amount of tokens to repay for the loan.
     @return The amount of tokens to repay for the loan of the caller.
     @notice This function retrieves the loan data of the caller based on the pool ID and returns the amount of tokens to repay for the loan.
     */
-    function getRepayAmount(uint32 _poolId) public view returns (uint256) {
-        Loan memory loanData = loans[_poolId][msg.sender];
+    function getRepayAmount() public view returns (uint256) {
+        Loan memory loanData = loans[msg.sender];
         return loanData.repayAmount;
     }
 
     /**
     @dev Returns the total liquidity of a pool by providing the pool ID.
-    @param _poolId The ID of the pool from which the caller wants to get the total liquidity.
     @return The total liquidity of the pool.
     @notice This function retrieves the pool data based on the pool ID and calculates the total liquidity of the pool by adding the total borrow amount and the current amount and subtracting the total reserve amount.
     */
-    function getTotalLiquidity(uint32 _poolId) internal view returns (uint256) {
-        Pool memory pool = pools[_poolId];
+    function getTotalLiquidity() internal view returns (uint256) {
         return
-            pool.totalBorrowAmount.add(pool.currentAmount).sub(
-                pool.totalReserveAmount
-            );
+            totalBorrowAmount.add(currentBalanceAmount).sub(totalReserveAmount);
     }
 
     /**
@@ -562,21 +450,18 @@ contract LendingVault is Ownable, ReEntrancyGuard {
 
     // Function to calculate total repayment amount including interest and fees
     function calculateRepaymentAmount(
-        uint256 _poolId,
         uint256 _loanAmount,
         uint256 _duration
     ) internal view returns (uint256, uint256, uint256) {
-        Pool memory pool = pools[_poolId];
         // Calculate interest charged on the loan
         uint256 interestAmount = calculateInterest(
             _loanAmount,
-            pool.interestRate,
+            interestRate,
             _duration
         );
 
         // Calculate fees charged on the loan
-        uint256 reserveFees = (_loanAmount * pool.reserveFeeRate) / 100;
-        uint256 feeAmount = reserveFees;
+        uint256 feeAmount = (_loanAmount * reserveFeeRate) / 100;
 
         // Calculate total amount due including interest and fees
         uint256 repayAmount = _loanAmount + interestAmount + feeAmount;
@@ -597,21 +482,17 @@ contract LendingVault is Ownable, ReEntrancyGuard {
 
     /**
     @dev Calculates the amount of tokens to deposit or withdraw based on the asset amount and the total liquidity of a pool by providing the pool ID.
-    @param _poolId The ID of the pool from which the caller wants to calculate the amount of tokens to deposit or withdraw.
     @param _assetAmount The amount of asset tokens the caller wants to deposit or withdraw.
     @return The amount of tokens to deposit or withdraw based on the asset amount and the total liquidity of the pool.
     @notice This function retrieves the pool data based on the pool ID and calculates the amount of tokens to deposit or withdraw based on the asset amount and the total liquidity of the pool.
     */
     function calculateAmount(
-        uint32 _poolId,
         uint256 _assetAmount
     ) internal view returns (uint256) {
-        Pool memory pool = pools[_poolId];
-
-        uint256 totalLiquidityAmount = getTotalLiquidity(_poolId);
+        uint256 totalLiquidityAmount = getTotalLiquidity();
 
         uint256 amount = _assetAmount.mul(totalLiquidityAmount).divCeil(
-            pool.totalAssetAmount
+            totalAssetAmount
         );
 
         return amount;
@@ -619,22 +500,17 @@ contract LendingVault is Ownable, ReEntrancyGuard {
 
     /**
     @dev Calculates the asset amount based on the pool ID and the amount.
-    @param _poolId The ID of the pool.
     @param _amount The amount to calculate the asset amount for.
     @return The calculated asset amount.
     */
     function calculateAssetAmount(
-        uint32 _poolId,
         uint256 _amount
     ) internal view returns (uint256) {
-        Pool memory pool = pools[_poolId];
+        uint256 totalLiquidityAmount = getTotalLiquidity();
 
-        uint256 totalLiquidityAmount = getTotalLiquidity(_poolId);
+        if (totalAssetAmount == 0 || totalLiquidityAmount == 0) return _amount;
 
-        if (pool.totalAssetAmount == 0 || totalLiquidityAmount == 0)
-            return _amount;
-
-        uint256 assetAmount = _amount.mul(pool.totalAssetAmount).div(
+        uint256 assetAmount = _amount.mul(totalAssetAmount).div(
             totalLiquidityAmount
         );
 
